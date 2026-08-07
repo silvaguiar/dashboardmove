@@ -67,7 +67,7 @@ export default function App() {
   const [sessions, setSessions] = useState<Session[]>([])
   const [answers, setAnswers] = useState<Answer[]>([])
   const [live, setLive] = useState(false)
-  const [lastUpdate, setLastUpdate] = useState(new Date())
+  const [now, setNow] = useState(new Date())
 
   async function load() {
     const [{ data: s }, { data: a }] = await Promise.all([
@@ -76,7 +76,6 @@ export default function App() {
     ])
     if (s) setSessions(s)
     if (a) setAnswers(a)
-    setLastUpdate(new Date())
   }
 
   useEffect(() => {
@@ -88,7 +87,14 @@ export default function App() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'survey_answers' }, load)
       .subscribe(status => setLive(status === 'SUBSCRIBED'))
 
-    return () => { supabase.removeChannel(channel) }
+    const pollId = setInterval(load, 5000)
+    const clockId = setInterval(() => setNow(new Date()), 1000)
+
+    return () => {
+      supabase.removeChannel(channel)
+      clearInterval(pollId)
+      clearInterval(clockId)
+    }
   }, [])
 
   const stats = buildStats(answers)
@@ -116,7 +122,7 @@ export default function App() {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
           <span style={{ color: '#555', fontSize: 12 }}>
-            atualizado {lastUpdate.toLocaleTimeString('pt-BR')}
+            {now.toLocaleTimeString('pt-BR')}
           </span>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <div style={{
