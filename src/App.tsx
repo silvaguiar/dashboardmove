@@ -1,270 +1,444 @@
-import { useEffect, useState } from 'react'
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts'
+import { useEffect, useMemo, useState } from 'react'
 import { supabase } from './supabase'
-
-const ACCENT = '#E8510A'
-const CARD_BG = '#161b22'
-const BORDER = '#21262d'
-const CHART_COLORS = ['#E8510A', '#c44008', '#8b2d06', '#6b2205', '#ff7033', '#ff9260', '#4d1804', '#ff5500']
-
-interface Answer {
-  session_id: string
-  question_key: string
-  question_label: string
-  answer: string
-}
-
-interface Session {
-  id: string
-  nome: string
-  fone: string
-  created_at: string
-}
-
-interface QuestionStat {
-  label: string
-  key: string
-  options: { name: string; count: number }[]
-  total: number
-}
-
-function buildStats(answers: Answer[]): QuestionStat[] {
-  const map = new Map<string, QuestionStat>()
-  for (const a of answers) {
-    if (!map.has(a.question_key)) {
-      map.set(a.question_key, { label: a.question_label, key: a.question_key, options: [], total: 0 })
-    }
-    const stat = map.get(a.question_key)!
-    const opt = stat.options.find(o => o.name === a.answer)
-    if (opt) opt.count++
-    else stat.options.push({ name: a.answer, count: 1 })
-    stat.total++
-  }
-  return Array.from(map.values())
-}
-
-function timeAgo(iso: string) {
-  const diff = Date.now() - new Date(iso).getTime()
-  const m = Math.floor(diff / 60000)
-  if (m < 1) return 'agora'
-  if (m < 60) return `${m}min atrás`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h atrás`
-  return `${Math.floor(h / 24)}d atrás`
-}
-
-const CustomTooltip = ({ active, payload }: any) => {
-  if (!active || !payload?.length) return null
-  return (
-    <div style={{ background: '#0D1117', border: `1px solid ${BORDER}`, borderRadius: 8, padding: '8px 12px' }}>
-      <p style={{ color: '#fff', fontWeight: 700 }}>{payload[0].payload.name}</p>
-      <p style={{ color: ACCENT, fontWeight: 700 }}>{payload[0].value} respostas</p>
-    </div>
-  )
-}
+import type { Answer, Session } from './types'
+import { fetchAll } from './lib/data'
+import { isAuthed, signOut } from './lib/auth'
+import { brl, digits, pct } from './lib/format'
+import {
+  buildInsights, buildQuestions, byHour, dedupeAnswers, dedupeSessions,
+  indexBySession, isValidPhone,
+} from './lib/stats'
+import { exportCsv, exportXlsx } from './lib/export'
+import Login from './components/Login'
+import { HourChart, QuestionCard } from './components/Charts'
+import { InsightCard } from './components/Insights'
+import LeadsTable from './components/LeadsTable'
+import { Empty, Kpi, Section } from './components/Ui'
 
 export default function App() {
-  const [sessions, setSessions] = useState<Session[]>([])
-  const [answers, setAnswers] = useState<Answer[]>([])
+  const [authed, setAuthed] = useState(isAuthed)
+  if (!authed) return <Login onSuccess={() => setAuthed(true)} />
+  return <Dashboard onSignOut={() => { signOut(); setAuthed(false) }} />
+}
+
+function Dashboard({ onSignOut }: { onSignOut: () => void }) {
+  const [rawSessions, setSessions] = useState<Session[]>([])
+  const [rawAnswers, setAnswers] = useState<Answer[]>([])
+  const [dedupe, setDedupe] = useState(true)
   const [live, setLive] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [now, setNow] = useState(new Date())
 
-  async function load() {
-    const [{ data: s }, { data: a }] = await Promise.all([
-      supabase.from('survey_sessions').select('*').order('created_at', { ascending: false }),
-      supabase.from('survey_answers').select('*'),
-    ])
-    if (s) setSessions(s)
-    if (a) setAnswers(a)
-  }
+  /** questionKey -> resposta selecionada. Segmenta todo o painel. */
+  const [filters, setFilters] = useState<Record<string, string>>({})
+  const [search, setSearch] = useState('')
+  const [busy, setBusy] = useState<'xlsx' | 'csv' | null>(null)
 
   useEffect(() => {
+    let alive = true
+
+    async function load() {
+      try {
+        const [s, a] = await Promise.all([
+          fetchAll<Session>('survey_sessions', { column: 'created_at', ascending: false }),
+          fetchAll<Answer>('survey_answers'),
+        ])
+        if (!alive) return
+        setSessions(s)
+        setAnswers(a)
+        setLoadError(null)
+      } catch (err) {
+        // Sem isto o painel seguiria mostrando números velhos como se fossem atuais.
+        if (!alive) return
+        console.error(err)
+        setLoadError(err instanceof Error ? err.message : 'Falha ao carregar os dados.')
+      } finally {
+        if (alive) setLoading(false)
+      }
+    }
+
     load()
 
     const channel = supabase
       .channel('realtime-dashboard')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'survey_sessions' }, load)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'survey_answers' }, load)
-      .subscribe(status => setLive(status === 'SUBSCRIBED'))
+      .subscribe(status => alive && setLive(status === 'SUBSCRIBED'))
 
-    const pollId = setInterval(load, 5000)
-    const clockId = setInterval(() => setNow(new Date()), 1000)
+    // Rede de segurança caso o websocket caia sem avisar.
+    const poll = setInterval(load, 15000)
+    const clock = setInterval(() => setNow(new Date()), 1000)
 
     return () => {
+      alive = false
       supabase.removeChannel(channel)
-      clearInterval(pollId)
-      clearInterval(clockId)
+      clearInterval(poll)
+      clearInterval(clock)
     }
   }, [])
 
-  const stats = buildStats(answers)
-  const uniqueUsers = new Set(sessions.map(s => s.id)).size
+  // ---- Limpeza da base, antes de qualquer estatística.
+  // Resposta repetida da mesma pessoa é sempre erro de captura: colapsa sempre.
+  const cleanAnswers = useMemo(() => dedupeAnswers(rawAnswers), [rawAnswers])
+
+  const answerCount = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const a of cleanAnswers) m.set(a.session_id, (m.get(a.session_id) ?? 0) + 1)
+    return m
+  }, [cleanAnswers])
+
+  // Cadastro repetido do mesmo telefone é opcional: o operador decide se quer
+  // ver pessoas únicas ou todos os preenchimentos.
+  const { kept, duplicates } = useMemo(
+    () => dedupeSessions(rawSessions, answerCount),
+    [rawSessions, answerCount],
+  )
+
+  const sessions = dedupe ? kept : rawSessions
+  const answers = useMemo(() => {
+    if (!dedupe) return cleanAnswers
+    const ids = new Set(sessions.map(s => s.id))
+    return cleanAnswers.filter(a => ids.has(a.session_id))
+  }, [cleanAnswers, sessions, dedupe])
+
+  // Estrutura das perguntas vem sempre da base completa, para que as colunas
+  // do export e o layout dos cartões não mudem quando um filtro é aplicado.
+  const baseQuestions = useMemo(() => buildQuestions(answers), [answers])
+  const bySession = useMemo(() => indexBySession(answers), [answers])
+
+  const activeFilters = Object.entries(filters)
+
+  const filteredSessions = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    const qDigits = digits(search)
+
+    return sessions.filter(s => {
+      const row = bySession.get(s.id)
+      for (const [key, value] of activeFilters) {
+        if (row?.get(key) !== value) return false
+      }
+      if (!q) return true
+      const nameHit = (s.nome ?? '').toLowerCase().includes(q)
+      const phoneHit = qDigits.length > 0 && digits(s.fone).includes(qDigits)
+      return nameHit || phoneHit
+    })
+  }, [sessions, bySession, filters, search])
+
+  const filteredAnswers = useMemo(() => {
+    if (activeFilters.length === 0 && !search.trim()) return answers
+    const ids = new Set(filteredSessions.map(s => s.id))
+    return answers.filter(a => ids.has(a.session_id))
+  }, [answers, filteredSessions, filters, search])
+
+  const viewQuestions = useMemo(() => buildQuestions(filteredAnswers), [filteredAnswers])
+  const viewByKey = useMemo(
+    () => new Map(viewQuestions.map(q => [q.key, q])),
+    [viewQuestions],
+  )
+
+  const hours = useMemo(() => byHour(filteredSessions), [filteredSessions])
+  const insights = useMemo(
+    () => buildInsights(viewQuestions, filteredSessions, hours),
+    [viewQuestions, filteredSessions, hours],
+  )
+
+  const leads = filteredSessions.filter(s => isValidPhone(s.fone)).length
+  const segmented = activeFilters.length > 0 || search.trim().length > 0
+
+  // Preço de referência para o KPI: o valor que o público atribui ao produto.
+  const headline =
+    viewQuestions.find(q => q.numeric && q.label.toLowerCase().includes('custa')) ??
+    viewQuestions.find(q => q.numeric)
+
+  async function doExport(kind: 'xlsx' | 'csv') {
+    setBusy(kind)
+    try {
+      const suffix = segmented ? '_segmento' : ''
+      if (kind === 'xlsx') {
+        await exportXlsx(filteredSessions, filteredAnswers, baseQuestions, suffix)
+      } else {
+        exportCsv(filteredSessions, filteredAnswers, baseQuestions, suffix)
+      }
+    } catch (err) {
+      console.error(err)
+      alert('Não foi possível gerar o arquivo. Tente novamente.')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  function toggleFilter(key: string, answer: string) {
+    setFilters(f => (f[key] === answer ? omit(f, key) : { ...f, [key]: answer }))
+  }
 
   return (
-    <div style={{ minHeight: '100vh', background: '#0D1117' }}>
+    <div style={{ minHeight: '100vh' }}>
 
-      {/* Header */}
+      {/* ---------- Cabeçalho ---------- */}
       <header style={{
-        borderBottom: `1px solid ${BORDER}`,
-        padding: '20px 32px',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
         position: 'sticky',
         top: 0,
-        background: '#0D1117',
-        zIndex: 10,
+        zIndex: 20,
+        borderBottom: '1px solid var(--border)',
+        background: 'rgba(7,8,12,.82)',
+        backdropFilter: 'blur(20px)',
+        WebkitBackdropFilter: 'blur(20px)',
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-          <span style={{ color: ACCENT, fontSize: 28, fontWeight: 900, letterSpacing: 6 }}>MOVE</span>
-          <span style={{ color: '#555', fontSize: 14 }}>|</span>
-          <span style={{ color: '#888', fontSize: 14, fontWeight: 600, letterSpacing: 2 }}>DASHBOARD</span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
-          <span style={{ color: '#555', fontSize: 12 }}>
-            {now.toLocaleTimeString('pt-BR')}
-          </span>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <div style={{
-              width: 8, height: 8, borderRadius: '50%',
-              background: live ? '#4ade80' : '#f87171',
-              boxShadow: live ? '0 0 8px #4ade80' : 'none',
-            }} />
-            <span style={{ fontSize: 12, color: live ? '#4ade80' : '#f87171', fontWeight: 600 }}>
-              {live ? 'AO VIVO' : 'OFFLINE'}
+        <div style={{
+          maxWidth: 1280,
+          margin: '0 auto',
+          padding: '14px 28px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 16,
+          flexWrap: 'wrap',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            <span className="grad-text num" style={{ fontSize: 24, letterSpacing: '0.2em' }}>
+              MOVE
             </span>
+            <span style={{ width: 1, height: 20, background: 'var(--border-str)' }} />
+            <span className="eyebrow" style={{ letterSpacing: '0.18em' }}>
+              Inteligência de marca
+            </span>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <div className="chip" style={{ gap: 7 }}>
+              <span className={`dot ${live ? 'dot-live' : 'dot-off'}`} />
+              <span style={{ color: live ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
+                {live ? 'AO VIVO' : 'RECONECTANDO'}
+              </span>
+              <span style={{ color: 'var(--faint)' }}>·</span>
+              <span className="num" style={{ fontWeight: 600, color: 'var(--muted)' }}>
+                {now.toLocaleTimeString('pt-BR')}
+              </span>
+            </div>
+
+            <button className="btn" onClick={() => doExport('csv')} disabled={busy !== null}>
+              CSV
+            </button>
+
+            <button
+              className="btn btn-accent"
+              onClick={() => doExport('xlsx')}
+              disabled={busy !== null || filteredSessions.length === 0}
+            >
+              {busy === 'xlsx' ? 'Gerando…' : `Exportar Excel (${filteredSessions.length})`}
+            </button>
+
+            <button className="btn" onClick={onSignOut} title="Sair do painel">Sair</button>
           </div>
         </div>
       </header>
 
-      <main style={{ padding: '32px', maxWidth: 1200, margin: '0 auto' }}>
+      <main style={{ maxWidth: 1280, margin: '0 auto', padding: '30px 28px 72px' }}>
 
-        {/* KPIs */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 32 }}>
-          {[
-            { label: 'PARTICIPANTES', value: uniqueUsers, sub: 'pessoas únicas' },
-            { label: 'RESPOSTAS', value: answers.length, sub: 'total de respostas' },
-            { label: 'PERGUNTAS', value: stats.length, sub: 'questões ativas' },
-          ].map(kpi => (
-            <div key={kpi.label} style={{
-              background: CARD_BG,
-              border: `1px solid ${BORDER}`,
-              borderRadius: 12,
-              padding: '24px 28px',
-            }}>
-              <p style={{ color: '#555', fontSize: 11, fontWeight: 700, letterSpacing: 2, marginBottom: 8 }}>
-                {kpi.label}
-              </p>
-              <p style={{ color: ACCENT, fontSize: 48, fontWeight: 900, lineHeight: 1 }}>{kpi.value}</p>
-              <p style={{ color: '#555', fontSize: 12, marginTop: 6 }}>{kpi.sub}</p>
-            </div>
-          ))}
-        </div>
-
-        {/* Gráficos por pergunta */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 32 }}>
-          {stats.map(stat => (
-            <div key={stat.key} style={{
-              background: CARD_BG,
-              border: `1px solid ${BORDER}`,
-              borderRadius: 12,
-              padding: '24px',
-            }}>
-              <p style={{ color: '#888', fontSize: 11, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>
-                {stat.total} respostas
-              </p>
-              <p style={{ color: '#fff', fontSize: 14, fontWeight: 700, marginBottom: 20, lineHeight: 1.4 }}>
-                {stat.label}
-              </p>
-
-              <ResponsiveContainer width="100%" height={Math.max(120, stat.options.length * 48)}>
-                <BarChart data={stat.options} layout="vertical" margin={{ left: 0, right: 16 }}>
-                  <XAxis type="number" hide />
-                  <YAxis
-                    type="category"
-                    dataKey="name"
-                    width={160}
-                    tick={{ fill: '#888', fontSize: 11 }}
-                    tickLine={false}
-                    axisLine={false}
-                    tickFormatter={(v: string) => v.length > 20 ? v.slice(0, 18) + '…' : v}
-                  />
-                  <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
-                  <Bar dataKey="count" radius={[0, 6, 6, 0]} maxBarSize={32}>
-                    {stat.options.map((_, i) => (
-                      <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-
-              {/* % breakdown */}
-              <div style={{ display: 'flex', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
-                {stat.options.map(opt => (
-                  <div key={opt.name} style={{
-                    background: '#0D1117',
-                    borderRadius: 6,
-                    padding: '4px 10px',
-                    fontSize: 11,
-                    color: '#888',
-                  }}>
-                    <span style={{ color: ACCENT, fontWeight: 700 }}>
-                      {stat.total > 0 ? Math.round((opt.count / stat.total) * 100) : 0}%
-                    </span>
-                    {' '}{opt.name}
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-
-        {/* Últimos participantes */}
-        <div style={{
-          background: CARD_BG,
-          border: `1px solid ${BORDER}`,
-          borderRadius: 12,
-          padding: '24px',
-        }}>
-          <p style={{ color: '#888', fontSize: 11, fontWeight: 700, letterSpacing: 2, marginBottom: 20 }}>
-            ÚLTIMOS PARTICIPANTES
-          </p>
-          {sessions.length === 0 && (
-            <p style={{ color: '#555', textAlign: 'center', padding: '32px 0' }}>
-              Nenhum participante ainda
-            </p>
-          )}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-            {sessions.slice(0, 20).map((s, i) => (
-              <div key={s.id} style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                padding: '12px 16px',
-                borderRadius: 8,
-                background: i % 2 === 0 ? 'rgba(255,255,255,0.02)' : 'transparent',
-              }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                  <div style={{
-                    width: 32, height: 32, borderRadius: '50%',
-                    background: ACCENT + '22',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    color: ACCENT, fontWeight: 700, fontSize: 13,
-                  }}>
-                    {s.nome?.[0] ?? '?'}
-                  </div>
-                  <div>
-                    <p style={{ fontWeight: 700, fontSize: 14 }}>{s.nome}</p>
-                    <p style={{ color: '#555', fontSize: 12 }}>{s.fone || '—'}</p>
-                  </div>
-                </div>
-                <span style={{ color: '#555', fontSize: 12 }}>{timeAgo(s.created_at)}</span>
-              </div>
+        {/* ---------- Segmento ativo ---------- */}
+        {segmented && (
+          <div className="card anim" style={{
+            padding: '12px 16px',
+            marginBottom: 22,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            flexWrap: 'wrap',
+            borderColor: 'rgba(255,90,31,.3)',
+          }}>
+            <span className="eyebrow" style={{ color: 'var(--accent-2)' }}>Segmento ativo</span>
+            {activeFilters.map(([key, value]) => (
+              <button
+                key={key}
+                className="chip chip-on"
+                onClick={() => setFilters(f => omit(f, key))}
+                title="Remover filtro"
+              >
+                {value} <span style={{ opacity: .6 }}>✕</span>
+              </button>
             ))}
+            {search.trim() && (
+              <button className="chip chip-on" onClick={() => setSearch('')}>
+                busca: {search} <span style={{ opacity: .6 }}>✕</span>
+              </button>
+            )}
+            <span style={{ color: 'var(--muted)', fontSize: 12.5 }}>
+              {filteredSessions.length} de {sessions.length} participantes
+              {sessions.length > 0 && ` (${pct(filteredSessions.length, sessions.length)}%)`}
+            </span>
+            <button
+              className="btn"
+              style={{ marginLeft: 'auto', padding: '6px 12px', fontSize: 12 }}
+              onClick={() => { setFilters({}); setSearch('') }}
+            >
+              Limpar tudo
+            </button>
           </div>
+        )}
+
+        {/* ---------- Qualidade da base ---------- */}
+        {duplicates > 0 && (
+          <div className="card anim" style={{
+            padding: '11px 16px',
+            marginBottom: 22,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            flexWrap: 'wrap',
+          }}>
+            <span className="eyebrow">Qualidade da base</span>
+            <span style={{ color: 'var(--text-2)', fontSize: 12.5 }}>
+              {duplicates} {duplicates === 1 ? 'cadastro repetido' : 'cadastros repetidos'} do
+              mesmo telefone {dedupe ? 'fora da contagem' : 'incluídos na contagem'}.
+            </span>
+            <button
+              className={`chip chip-btn${dedupe ? ' chip-on' : ''}`}
+              style={{ marginLeft: 'auto' }}
+              onClick={() => setDedupe(d => !d)}
+              title="Vale para os números, os gráficos e o export"
+            >
+              {dedupe ? '✓ ' : ''}Contar só pessoas únicas
+            </button>
+          </div>
+        )}
+
+        {/* ---------- Falha de leitura ---------- */}
+        {loadError && (
+          <div className="card anim" style={{
+            padding: '13px 16px',
+            marginBottom: 22,
+            borderColor: 'rgba(255,95,86,.4)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            flexWrap: 'wrap',
+          }}>
+            <span className="eyebrow" style={{ color: 'var(--red)' }}>Falha na atualização</span>
+            <span style={{ color: 'var(--text-2)', fontSize: 12.5 }}>
+              Os números abaixo podem estar desatualizados — {loadError}
+            </span>
+          </div>
+        )}
+
+        {/* ---------- KPIs ---------- */}
+        <div className="grid-kpi" style={{ marginBottom: 30 }}>
+          <Kpi
+            label="Participantes"
+            value={filteredSessions.length}
+            sub={
+              segmented
+                ? `de ${sessions.length} no total`
+                : dedupe ? 'pessoas únicas' : 'cadastros (com repetidos)'
+            }
+            accent
+            delay={0}
+          />
+          <Kpi
+            label="Leads com telefone"
+            value={leads}
+            sub={`${pct(leads, filteredSessions.length)}% prontos para campanha`}
+            delay={60}
+          />
+          <Kpi
+            label="Respostas"
+            value={filteredAnswers.length}
+            sub={`${baseQuestions.length} perguntas ativas`}
+            delay={120}
+          />
+          <Kpi
+            label="Valor percebido"
+            value={headline?.stats ? brl(headline.stats.median) : '—'}
+            sub={headline?.stats ? `mediana · média ${brl(headline.stats.avg)}` : 'sem dado de preço'}
+            accent
+            delay={180}
+          />
         </div>
 
+        {loading ? (
+          <div className="card card-pad">
+            <Empty>Carregando dados da pesquisa…</Empty>
+          </div>
+        ) : sessions.length === 0 ? (
+          <div className="card card-pad">
+            <Empty>Nenhuma resposta registrada ainda. O painel atualiza sozinho.</Empty>
+          </div>
+        ) : (
+          <>
+            {/* ---------- Insights ---------- */}
+            {insights.length > 0 && (
+              <Section
+                title="Leitura para campanha"
+                hint="Recomendações geradas a partir das respostas do segmento atual."
+              >
+                <div className="grid-3">
+                  {insights.map((ins, i) => (
+                    <InsightCard key={ins.tag + i} insight={ins} delay={i * 60} />
+                  ))}
+                </div>
+              </Section>
+            )}
+
+            {/* ---------- Perguntas ---------- */}
+            <Section
+              title="Respostas por pergunta"
+              hint="Clique em qualquer barra para segmentar todo o painel por aquela resposta."
+            >
+              <div className="grid-2">
+                {baseQuestions.map((q, i) => {
+                  const view = viewByKey.get(q.key) ?? { ...q, options: [], total: 0, stats: null }
+                  return (
+                    <QuestionCard
+                      key={q.key}
+                      question={view}
+                      active={filters[q.key] ?? null}
+                      onPick={answer => toggleFilter(q.key, answer)}
+                      delay={i * 60}
+                    />
+                  )
+                })}
+              </div>
+            </Section>
+
+            {/* ---------- Operação + base ---------- */}
+            <Section
+              title="Base e operação"
+              hint="Quem respondeu, quando, e o que cada pessoa marcou."
+            >
+              <div style={{ display: 'grid', gap: 16 }}>
+                <HourChart data={hours} />
+                <LeadsTable
+                  sessions={filteredSessions}
+                  answersBySession={bySession}
+                  questions={baseQuestions}
+                  search={search}
+                  onSearch={setSearch}
+                />
+              </div>
+            </Section>
+          </>
+        )}
+
+        <footer style={{
+          marginTop: 40,
+          paddingTop: 22,
+          borderTop: '1px solid var(--border)',
+          color: 'var(--faint)',
+          fontSize: 11.5,
+          display: 'flex',
+          justifyContent: 'space-between',
+          gap: 12,
+          flexWrap: 'wrap',
+        }}>
+          <span>MOVE · painel de pesquisa em tempo real</span>
+          <span>Atualizado às {now.toLocaleTimeString('pt-BR')}</span>
+        </footer>
       </main>
     </div>
   )
+}
+
+function omit(obj: Record<string, string>, key: string): Record<string, string> {
+  const { [key]: _, ...rest } = obj
+  return rest
 }
